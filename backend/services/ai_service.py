@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, AuthenticationError, OpenAI
 from pydantic import ValidationError
 from dotenv import load_dotenv
 
@@ -64,12 +64,43 @@ Answer ONLY using the provided analysis.
 Do not hallucinate.
 Be concise and practical."""
 
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_MAX_OUTPUT_TOKENS = 1800
+
 
 def _get_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not set.")
-    return OpenAI(api_key=api_key)
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    # Treat sk-or-v1 keys as OpenRouter keys for convenience.
+    if openrouter_api_key or (openai_api_key and openai_api_key.startswith("sk-or-v1-")):
+        api_key = openrouter_api_key or openai_api_key
+        return OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    if openai_api_key:
+        return OpenAI(api_key=openai_api_key)
+
+    raise ValueError("Set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file.")
+
+
+def _get_model_name() -> str:
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if openrouter_api_key or (openai_api_key and openai_api_key.startswith("sk-or-v1-")):
+        return os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
+    return os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+
+def _get_max_output_tokens() -> int:
+    configured = os.getenv("LLM_MAX_OUTPUT_TOKENS")
+    if configured and configured.isdigit():
+        return int(configured)
+    return DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _extract_json_payload(raw_text: str) -> dict[str, Any]:
@@ -121,13 +152,30 @@ def _analysis_messages(data: AnalyzeRequest, strict_json_retry: bool = False) ->
 
 def generate_analysis(data: AnalyzeRequest) -> AnalysisResponse:
     client = _get_client()
+    model_name = _get_model_name()
+    max_output_tokens = _get_max_output_tokens()
     last_error: Exception | None = None
 
     for attempt in range(2):
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=_analysis_messages(data, strict_json_retry=attempt > 0),
-        )
+        try:
+            response = client.responses.create(
+                model=model_name,
+                input=_analysis_messages(data, strict_json_retry=attempt > 0),
+                max_output_tokens=max_output_tokens,
+            )
+        except AuthenticationError as exc:
+            raise ValueError(
+                "Invalid LLM API key. Update OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file."
+            ) from exc
+        except APIConnectionError as exc:
+            raise ValueError("Unable to reach the LLM provider. Check your internet connection and try again.") from exc
+        except APIStatusError as exc:
+            if exc.status_code == 402:
+                raise ValueError(
+                    "Your OpenRouter account does not have enough credits for this request. Add credits or lower the model cost."
+                ) from exc
+            raise ValueError(f"LLM provider error: {exc.status_code}") from exc
+
         raw_text = response.output_text.strip()
 
         try:
@@ -147,19 +195,36 @@ def analyze_product(data: AnalyzeRequest) -> AnalysisResponse:
 
 def generate_chat_response(query: str, context: AnalysisResponse) -> str:
     client = _get_client()
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Analysis JSON:\n{context.model_dump_json(indent=2)}\n\n"
-                    f"User question: {query.strip()}"
-                ),
-            },
-        ],
-    )
+    model_name = _get_model_name()
+    max_output_tokens = min(_get_max_output_tokens(), 600)
+    try:
+        response = client.responses.create(
+            model=model_name,
+            input=[
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Analysis JSON:\n{context.model_dump_json(indent=2)}\n\n"
+                        f"User question: {query.strip()}"
+                    ),
+                },
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+    except AuthenticationError as exc:
+        raise ValueError(
+            "Invalid LLM API key. Update OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file."
+        ) from exc
+    except APIConnectionError as exc:
+        raise ValueError("Unable to reach the LLM provider. Check your internet connection and try again.") from exc
+    except APIStatusError as exc:
+        if exc.status_code == 402:
+            raise ValueError(
+                "Your OpenRouter account does not have enough credits for this request. Add credits or lower the model cost."
+            ) from exc
+        raise ValueError(f"LLM provider error: {exc.status_code}") from exc
+
     answer = response.output_text.strip()
     if not answer:
         raise ValueError("Failed to generate chat response.")
